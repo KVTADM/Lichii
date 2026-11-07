@@ -907,8 +907,9 @@ void GraphicsPipeline::RecordMeshFallback(u32 groups, MeshFallbackScratch& scrat
     }
     // Debug modes, to find what faults: EDEN_NX2_MESH_FALLBACK (at start) or the first letter of
     // the file EDEN_NX2_MESH_FALLBACK_MODE_FILE (read every 256 draws, so it can change in game):
-    // d = dispatch only, b = also bind the draw's set, t = draw one triangle directly instead of
-    // the indirect draw, s = skip the draw entirely (no dispatch either), anything else = full.
+    // d = dispatch only, b = also bind the draw's set, t = draw one triangle, i = indirect draw,
+    // z = draw with every vertex collapsed, s = skip the draw entirely (no dispatch either),
+    // anything else = full (a direct draw of the whole capacity).
     static char mode{[] {
         const char* const value{std::getenv("EDEN_NX2_MESH_FALLBACK")};
         return value != nullptr && value[0] != 0 ? value[0] : 'f';
@@ -1025,8 +1026,8 @@ void GraphicsPipeline::RecordMeshFallback(u32 groups, MeshFallbackScratch& scrat
     if (dispatch_only) {
         return;
     }
-    scheduler.Record([this, buffer, fallback_set, offset = *offset,
-                      draw_mode = mode](vk::CommandBuffer cmdbuf) {
+    scheduler.Record([this, buffer, fallback_set, offset = *offset, draw_mode = mode,
+                      capacity = static_cast<u32>(capacity)](vk::CommandBuffer cmdbuf) {
         if (scheduler.GraphicsPipelineMissing() || !fallback_compute) {
             return;
         }
@@ -1039,7 +1040,13 @@ void GraphicsPipeline::RecordMeshFallback(u32 groups, MeshFallbackScratch& scrat
             cmdbuf.Draw(3, 1, 0, 0);
             return;
         }
-        cmdbuf.DrawIndirect(buffer, offset, 1, 0);
+        if (draw_mode == 'i') {
+            cmdbuf.DrawIndirect(buffer, offset, 1, 0);
+            return;
+        }
+        // The whole capacity: the vertex shader collapses the vertices past the reserved count.
+        // (vkCmdDrawIndirect from the same buffer hung RDNA1, see mode i.)
+        cmdbuf.Draw(capacity, 1, 0, 0);
     });
 }
 
