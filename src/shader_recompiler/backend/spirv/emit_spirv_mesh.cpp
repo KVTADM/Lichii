@@ -376,7 +376,6 @@ std::vector<u32> EmitMeshFallbackVertex(const Profile& profile, const MeshInfo& 
     module.Decorate(vertex_index, spv::Decoration::BuiltIn, spv::BuiltIn::VertexIndex);
     interfaces.push_back(vertex_index);
     const Id output_vec4{module.TypePointer(spv::StorageClass::Output, vec4_id)};
-    const Id output_f32{module.TypePointer(spv::StorageClass::Output, f32_id)};
     const Id position{module.AddGlobalVariable(output_vec4, spv::StorageClass::Output)};
     module.Decorate(position, spv::Decoration::BuiltIn, spv::BuiltIn::Position);
     interfaces.push_back(position);
@@ -420,34 +419,43 @@ std::vector<u32> EmitMeshFallbackVertex(const Profile& profile, const MeshInfo& 
     const u32 num_lines{static_cast<u32>(mesh.vertex_lines.size())};
     const Id first{module.OpIAdd(u32_id, u32_const(MESH_FALLBACK_HEADER_WORDS),
                                  module.OpIMul(u32_id, safe_index, u32_const(num_lines)))};
-    const Id default_value{module.ConstantComposite(vec4_id, f32_zero, f32_zero, f32_zero, f32_one)};
-    module.OpStore(position, default_value);
-    for (const Id generic : generics) {
-        if (Sirit::ValidId(generic)) {
-            module.OpStore(generic, default_value);
-        }
+    // Each output is stored once, whole. A vertex out of range goes outside the clip volume
+    // (x = 2w, w = 1): a position with w = 0 hangs the RX 5700 XT's rasterizer.
+    const Id f32_two{module.Constant(f32_id, 2.0f)};
+    std::array<std::array<Id, 4>, IR::NUM_GENERICS> generic_values{};
+    std::array<Id, 4> position_values{f32_zero, f32_zero, f32_zero, f32_one};
+    for (auto& values : generic_values) {
+        values = {f32_zero, f32_zero, f32_zero, f32_one};
     }
     for (u32 line = 0; line < num_lines; ++line) {
         const IR::Attribute attribute{mesh.vertex_lines[line]};
-        Id variable{};
-        u32 element{};
+        Id* target{};
         if (IR::IsGeneric(attribute)) {
-            variable = generics[IR::GenericAttributeIndex(attribute)];
-            element = IR::GenericAttributeElement(attribute);
+            target = &generic_values[IR::GenericAttributeIndex(attribute)]
+                                    [IR::GenericAttributeElement(attribute)];
         } else if (attribute >= IR::Attribute::PositionX && attribute <= IR::Attribute::PositionW) {
-            variable = position;
-            element = static_cast<u32>(attribute) - static_cast<u32>(IR::Attribute::PositionX);
+            target = &position_values[static_cast<u32>(attribute) -
+                                      static_cast<u32>(IR::Attribute::PositionX)];
         } else {
             continue;
         }
         const Id word{module.OpLoad(
             u32_id, module.OpAccessChain(buffer_u32, buffer, u32_const(0),
                                          module.OpIAdd(u32_id, first, u32_const(line))))};
-        Id value{module.OpBitcast(f32_id, word)};
-        if (variable.value == position.value) {
-            value = module.OpSelect(f32_id, in_range, value, f32_zero);
+        *target = module.OpBitcast(f32_id, word);
+    }
+    const Id position_value{module.OpCompositeConstruct(vec4_id, position_values[0],
+                                                        position_values[1], position_values[2],
+                                                        position_values[3])};
+    const Id outside{module.ConstantComposite(vec4_id, f32_two, f32_two, f32_zero, f32_one)};
+    module.OpStore(position, module.OpSelect(vec4_id, in_range, position_value, outside));
+    for (u32 index = 0; index < IR::NUM_GENERICS; ++index) {
+        if (Sirit::ValidId(generics[index])) {
+            const auto& values{generic_values[index]};
+            module.OpStore(generics[index], module.OpCompositeConstruct(vec4_id, values[0],
+                                                                        values[1], values[2],
+                                                                        values[3]));
         }
-        module.OpStore(module.OpAccessChain(output_f32, variable, u32_const(element)), value);
     }
     module.OpReturn();
     module.OpFunctionEnd();
