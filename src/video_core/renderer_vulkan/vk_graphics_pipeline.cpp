@@ -943,7 +943,9 @@ void GraphicsPipeline::RecordMeshFallback(u32 groups, MeshFallbackScratch& scrat
     const VkDescriptorSet fallback_set{scratch.DescriptorSet()};
     // The dispatch runs outside the render pass, then the draw resumes it.
     scheduler.RequestOutsideRenderPassOperationContext();
-    scheduler.Record([this, groups, buffer, fallback_set, offset = *offset,
+    // z: draw, but the vertex shader collapses every triangle (nothing rasterized).
+    const bool collapse{mode == 'z'};
+    scheduler.Record([this, groups, buffer, fallback_set, offset = *offset, collapse,
                       capacity = static_cast<u32>(capacity)](vk::CommandBuffer cmdbuf) {
         if (scheduler.GraphicsPipelineMissing() || !fallback_compute) {
             return;
@@ -954,6 +956,8 @@ void GraphicsPipeline::RecordMeshFallback(u32 groups, MeshFallbackScratch& scrat
         cmdbuf.FillBuffer(buffer, offset + 8, 8, 0);
         cmdbuf.FillBuffer(buffer, offset + Shader::Backend::SPIRV::MESH_FALLBACK_CAPACITY_WORD * 4,
                           4, capacity);
+        cmdbuf.FillBuffer(buffer, offset + Shader::Backend::SPIRV::MESH_FALLBACK_DEBUG_WORD * 4, 4,
+                          collapse ? 1U : 0U);
         const VkMemoryBarrier fill_barrier{
             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
             .pNext = nullptr,

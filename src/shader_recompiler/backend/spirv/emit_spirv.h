@@ -37,6 +37,7 @@ constexpr u32 RENDERAREA_LAYOUT_OFFSET = offsetof(RenderAreaLayout, render_area)
 // VkDrawIndirectCommand whose vertex count the mesh workgroups bump, the vertex capacity, then
 // the vertices of the triangle list (one word per stage buffer vertex line).
 constexpr u32 MESH_FALLBACK_CAPACITY_WORD = 4;
+constexpr u32 MESH_FALLBACK_DEBUG_WORD = 5; ///< nonzero: the vertex shader collapses every vertex
 constexpr u32 MESH_FALLBACK_HEADER_WORDS = 16;
 
 [[nodiscard]] std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info, IR::Program& program, Bindings& bindings);

@@ -404,8 +404,12 @@ std::vector<u32> EmitMeshFallbackVertex(const Profile& profile, const MeshInfo& 
     const Id capacity{module.OpLoad(
         u32_id, module.OpAccessChain(buffer_u32, buffer, u32_const(0),
                                      u32_const(MESH_FALLBACK_CAPACITY_WORD)))};
+    const Id debug{module.OpLoad(
+        u32_id, module.OpAccessChain(buffer_u32, buffer, u32_const(0),
+                                     u32_const(MESH_FALLBACK_DEBUG_WORD)))};
     // Vertices past the capacity (the workgroups ran out of room) collapse to the origin.
-    const Id in_range{module.OpULessThan(bool_id, index, capacity)};
+    const Id in_range{module.OpLogicalAnd(bool_id, module.OpULessThan(bool_id, index, capacity),
+                                          module.OpIEqual(bool_id, debug, u32_const(0)))};
     const Id safe_index{module.OpSelect(u32_id, in_range, index, u32_const(0))};
     const u32 num_lines{static_cast<u32>(mesh.vertex_lines.size())};
     const Id first{module.OpIAdd(u32_id, u32_const(MESH_FALLBACK_HEADER_WORDS),
