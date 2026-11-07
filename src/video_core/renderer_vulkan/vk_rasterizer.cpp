@@ -440,6 +440,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     }
     // Task/mesh pipelines: the draw's vertex count is the number of task workgroups.
     mesh_draw = pipeline->IsMeshPipeline();
+    // Fork (KVTADM): mesh pipelines emulated with a compute shader on devices without
+    // VK_EXT_mesh_shader.
+    mesh_fallback_pipeline = mesh_draw && pipeline->HasMeshFallback() ? pipeline : nullptr;
     // EDEN_NX2_NO_MESH=1: skip task/mesh draws as before they were supported (A/B comparisons).
     // EDEN_NX2_NO_MESH_FILE=<path>: skip them while that file exists (checked every 1024 draws),
     // to compare the same scene with and without them in one run.
@@ -450,7 +453,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     if (no_mesh_file && (no_mesh_check++ % 1024) == 0) {
         no_mesh = std::filesystem::exists(no_mesh_file);
     }
-    if (mesh_draw && (no_mesh || !device.IsExtMeshShaderSupported())) {
+    if (mesh_draw && (no_mesh || (!device.IsExtMeshShaderSupported() && !mesh_fallback_pipeline))) {
         report_failure(no_mesh ? "EDEN_NX2_NO_MESH" : "no VK_EXT_mesh_shader");
         TraceRenderState(is_indexed, "mesh-skipped", nullptr);
         return;
@@ -804,6 +807,15 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
             ++trace_zero_direct;
         }
 
+        if (mesh_draw && mesh_fallback_pipeline) {
+            if (!mesh_fallback_scratch) {
+                mesh_fallback_scratch =
+                    std::make_unique<MeshFallbackScratch>(device, memory_allocator, scheduler);
+            }
+            mesh_fallback_pipeline->RecordMeshFallback(draw_params.num_vertices,
+                                                       *mesh_fallback_scratch);
+            return;
+        }
         if (mesh_draw) {
             scheduler.Record([this, groups = draw_params.num_vertices](vk::CommandBuffer cmdbuf) {
                 if (scheduler.GraphicsPipelineMissing()) {

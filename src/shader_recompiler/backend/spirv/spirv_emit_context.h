@@ -389,6 +389,9 @@ public:
     Id mesh_shared_u32{};   ///< pointer type to one workgroup word
     Id mesh_primitive_indices{};
     Id mesh_point_size{}; ///< PointSize output array of a mesh program, if any
+    Id mesh_fallback_buffer{}; ///< mesh fallback: the output buffer (set 1, binding 0)
+    Id mesh_fallback_u32{};    ///< mesh fallback: pointer type to one output buffer word
+    Id mesh_fallback_base{};   ///< mesh fallback: first output vertex of the workgroup
     MeshInfo mesh_info{};
     u32 mesh_threads{};
     u32 mesh_attribute_words{};
@@ -439,6 +442,7 @@ private:
     void DefineInputs(const IR::Program& program);
     void DefineOutputs(const IR::Program& program);
     void DefineMesh(const IR::Program& program);
+    void DefineMeshFallbackBuffer();
 };
 
 } // namespace Shader::Backend::SPIRV

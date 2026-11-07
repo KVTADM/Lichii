@@ -180,6 +180,95 @@ void MeshEpilogue(EmitContext& ctx) {
         });
     }
 }
+Id FallbackWord(EmitContext& ctx, Id index) {
+    return ctx.OpAccessChain(ctx.mesh_fallback_u32, ctx.mesh_fallback_buffer, ctx.u32_zero_value,
+                             index);
+}
+
+// Mesh fallback (no VK_EXT_mesh_shader): the program runs as a compute shader and appends its
+// triangles, three vertices each, to the fallback buffer, one word per vertex line, for
+// EmitMeshFallbackVertex to draw.
+void MeshFallbackEpilogue(EmitContext& ctx) {
+    const MeshInfo& mesh{ctx.mesh_info};
+    Barrier(ctx);
+    const Id count{ctx.OpUMin(ctx.U32[1], ctx.OpLoad(ctx.U32[1], ctx.mesh_primitive_count),
+                              ctx.Const(mesh.max_primitives))};
+    const u32 primitive_vertices{mesh.PrimitiveVertices()};
+    const Id invocation{LocalInvocation(ctx)};
+    // One invocation reserves the workgroup's vertices.
+    If(ctx, ctx.OpIEqual(ctx.U1, invocation, ctx.u32_zero_value), [&] {
+        const Id total{ctx.OpIMul(ctx.U32[1], count, ctx.Const(primitive_vertices))};
+        const Id base{ctx.OpAtomicIAdd(ctx.U32[1], FallbackWord(ctx, ctx.u32_zero_value),
+                                       ctx.Const(static_cast<u32>(spv::Scope::Device)),
+                                       ctx.u32_zero_value, total)};
+        ctx.OpStore(ctx.mesh_fallback_base, base);
+    });
+    Barrier(ctx);
+    const Id base{ctx.OpLoad(ctx.U32[1], ctx.mesh_fallback_base)};
+    const Id capacity{
+        ctx.OpLoad(ctx.U32[1], FallbackWord(ctx, ctx.Const(MESH_FALLBACK_CAPACITY_WORD)))};
+
+    const auto& lines{mesh.vertex_lines};
+    const u32 num_lines{static_cast<u32>(lines.size())};
+    const auto z_line{std::ranges::find(lines, static_cast<u32>(IR::Attribute::PositionZ))};
+    const auto w_line{std::ranges::find(lines, static_cast<u32>(IR::Attribute::PositionW))};
+    const bool convert_depth{ctx.runtime_info.convert_depth_mode && !ctx.profile.support_native_ndc &&
+                             z_line != lines.end() && w_line != lines.end()};
+    const u32 z_index{static_cast<u32>(z_line - lines.begin())};
+    const u32 w_index{static_cast<u32>(w_line - lines.begin())};
+    const Id last_vertex{ctx.Const(mesh.max_vertices > 0 ? mesh.max_vertices - 1 : 0U)};
+    const u32 threads{ctx.mesh_threads};
+    for (u32 first = 0; first < mesh.max_primitives; first += threads) {
+        const Id primitive{ctx.OpIAdd(ctx.U32[1], invocation, ctx.Const(first))};
+        If(ctx, ctx.OpULessThan(ctx.U1, primitive, count), [&] {
+            // Vertex indices: map bytes 4 + primitive_vertices * primitive.
+            const Id byte{ctx.OpIAdd(
+                ctx.U32[1], ctx.OpIMul(ctx.U32[1], primitive, ctx.Const(primitive_vertices)),
+                ctx.Const(4U))};
+            for (u32 element = 0; element < primitive_vertices; ++element) {
+                const Id output{ctx.OpIAdd(
+                    ctx.U32[1], base,
+                    ctx.OpIAdd(ctx.U32[1],
+                               ctx.OpIMul(ctx.U32[1], primitive, ctx.Const(primitive_vertices)),
+                               ctx.Const(element)))};
+                If(ctx, ctx.OpULessThan(ctx.U1, output, capacity), [&] {
+                    const Id address{ctx.OpIAdd(ctx.U32[1], byte, ctx.Const(element))};
+                    const Id vertex{ctx.OpUMin(
+                        ctx.U32[1], ctx.OpLoad(ctx.U32[1], SharedWord(ctx, ctx.mesh_map, address)),
+                        last_vertex)};
+                    // Word of line 0 in the attribute region (see CopyLines).
+                    const Id group{ctx.OpShiftRightLogical(ctx.U32[1], vertex, ctx.Const(5U))};
+                    const Id slot{ctx.OpBitwiseAnd(ctx.U32[1], vertex, ctx.Const(31U))};
+                    const Id source{ctx.OpIAdd(
+                        ctx.U32[1], ctx.OpIMul(ctx.U32[1], group, ctx.Const(num_lines * 32)), slot)};
+                    const Id destination{ctx.OpIAdd(
+                        ctx.U32[1], ctx.Const(MESH_FALLBACK_HEADER_WORDS),
+                        ctx.OpIMul(ctx.U32[1], output, ctx.Const(num_lines)))};
+                    const auto read = [&](u32 line) {
+                        return ctx.OpLoad(ctx.U32[1],
+                                          SharedWord(ctx, ctx.mesh_attributes,
+                                                     ctx.OpIAdd(ctx.U32[1], source,
+                                                                ctx.Const(line * 32))));
+                    };
+                    for (u32 line = 0; line < num_lines; ++line) {
+                        Id word{read(line)};
+                        if (convert_depth && line == z_index) {
+                            // OpenGL-style clip space: z = (z + w) / 2.
+                            const Id z{ctx.OpBitcast(ctx.F32[1], word)};
+                            const Id w{ctx.OpBitcast(ctx.F32[1], read(w_index))};
+                            word = ctx.OpBitcast(
+                                ctx.U32[1], ctx.OpFMul(ctx.F32[1], ctx.OpFAdd(ctx.F32[1], z, w),
+                                                       ctx.Const(0.5f)));
+                        }
+                        ctx.OpStore(FallbackWord(ctx, ctx.OpIAdd(ctx.U32[1], destination,
+                                                                 ctx.Const(line))),
+                                    word);
+                    }
+                });
+            }
+        });
+    }
+}
 } // Anonymous namespace
 
 Id EmitIsbeRead(EmitContext& ctx, Id address) {
@@ -234,8 +323,117 @@ void EmitMeshEpilogue(EmitContext& ctx) {
     if (ctx.stage == Stage::Task) {
         TaskEpilogue(ctx);
     } else if (ctx.stage == Stage::Mesh) {
-        MeshEpilogue(ctx);
+        if (ctx.runtime_info.mesh_fallback) {
+            MeshFallbackEpilogue(ctx);
+        } else {
+            MeshEpilogue(ctx);
+        }
     }
+}
+
+std::vector<u32> EmitMeshFallbackVertex(const Profile& profile, const MeshInfo& mesh) {
+    Sirit::Module module{profile.supported_spirv};
+    module.AddCapability(spv::Capability::Shader);
+    module.AddExtension("SPV_KHR_storage_buffer_storage_class");
+    const Id void_id{module.TypeVoid()};
+    const Id bool_id{module.TypeBool()};
+    const Id u32_id{module.TypeInt(32, false)};
+    const Id s32_id{module.TypeInt(32, true)};
+    const Id f32_id{module.TypeFloat(32)};
+    const Id vec4_id{module.TypeVector(f32_id, 4)};
+    const auto u32_const = [&](u32 value) { return module.Constant(u32_id, value); };
+    const Id f32_zero{module.Constant(f32_id, 0.0f)};
+    const Id f32_one{module.Constant(f32_id, 1.0f)};
+
+    // The fallback buffer, read only: vertex stages may not store without
+    // vertexPipelineStoresAndAtomics.
+    const Id array_type{module.TypeRuntimeArray(u32_id)};
+    module.Decorate(array_type, spv::Decoration::ArrayStride, 4U);
+    const Id struct_type{module.TypeStruct(array_type)};
+    module.Decorate(struct_type, spv::Decoration::Block);
+    module.MemberDecorate(struct_type, 0, spv::Decoration::Offset, 0U);
+    module.MemberDecorate(struct_type, 0, spv::Decoration::NonWritable);
+    const Id buffer{module.AddGlobalVariable(
+        module.TypePointer(spv::StorageClass::StorageBuffer, struct_type),
+        spv::StorageClass::StorageBuffer)};
+    module.Decorate(buffer, spv::Decoration::Binding, 0U);
+    module.Decorate(buffer, spv::Decoration::DescriptorSet, 1U);
+    const Id buffer_u32{module.TypePointer(spv::StorageClass::StorageBuffer, u32_id)};
+
+    std::vector<Id> interfaces;
+    const Id vertex_index{module.AddGlobalVariable(
+        module.TypePointer(spv::StorageClass::Input, s32_id), spv::StorageClass::Input)};
+    module.Decorate(vertex_index, spv::Decoration::BuiltIn, spv::BuiltIn::VertexIndex);
+    interfaces.push_back(vertex_index);
+    const Id output_vec4{module.TypePointer(spv::StorageClass::Output, vec4_id)};
+    const Id output_f32{module.TypePointer(spv::StorageClass::Output, f32_id)};
+    const Id position{module.AddGlobalVariable(output_vec4, spv::StorageClass::Output)};
+    module.Decorate(position, spv::Decoration::BuiltIn, spv::BuiltIn::Position);
+    interfaces.push_back(position);
+    std::array<Id, IR::NUM_GENERICS> generics{};
+    for (const u32 line : mesh.vertex_lines) {
+        const IR::Attribute attribute{line};
+        if (!IR::IsGeneric(attribute)) {
+            continue;
+        }
+        const u32 index{IR::GenericAttributeIndex(attribute)};
+        if (!Sirit::ValidId(generics[index])) {
+            generics[index] = module.AddGlobalVariable(output_vec4, spv::StorageClass::Output);
+            module.Decorate(generics[index], spv::Decoration::Location, index);
+            interfaces.push_back(generics[index]);
+        }
+    }
+    if (profile.supported_spirv >= 0x00010400) {
+        interfaces.push_back(buffer);
+    }
+
+    const Id main{module.OpFunction(void_id, spv::FunctionControlMask::MaskNone,
+                                    module.TypeFunction(void_id))};
+    module.AddLabel(module.OpLabel());
+    const Id index{module.OpBitcast(u32_id, module.OpLoad(s32_id, vertex_index))};
+    const Id capacity{module.OpLoad(
+        u32_id, module.OpAccessChain(buffer_u32, buffer, u32_const(0),
+                                     u32_const(MESH_FALLBACK_CAPACITY_WORD)))};
+    // Vertices past the capacity (the workgroups ran out of room) collapse to the origin.
+    const Id in_range{module.OpULessThan(bool_id, index, capacity)};
+    const Id safe_index{module.OpSelect(u32_id, in_range, index, u32_const(0))};
+    const u32 num_lines{static_cast<u32>(mesh.vertex_lines.size())};
+    const Id first{module.OpIAdd(u32_id, u32_const(MESH_FALLBACK_HEADER_WORDS),
+                                 module.OpIMul(u32_id, safe_index, u32_const(num_lines)))};
+    const Id default_value{module.ConstantComposite(vec4_id, f32_zero, f32_zero, f32_zero, f32_one)};
+    module.OpStore(position, default_value);
+    for (const Id generic : generics) {
+        if (Sirit::ValidId(generic)) {
+            module.OpStore(generic, default_value);
+        }
+    }
+    for (u32 line = 0; line < num_lines; ++line) {
+        const IR::Attribute attribute{mesh.vertex_lines[line]};
+        Id variable{};
+        u32 element{};
+        if (IR::IsGeneric(attribute)) {
+            variable = generics[IR::GenericAttributeIndex(attribute)];
+            element = IR::GenericAttributeElement(attribute);
+        } else if (attribute >= IR::Attribute::PositionX && attribute <= IR::Attribute::PositionW) {
+            variable = position;
+            element = static_cast<u32>(attribute) - static_cast<u32>(IR::Attribute::PositionX);
+        } else {
+            continue;
+        }
+        const Id word{module.OpLoad(
+            u32_id, module.OpAccessChain(buffer_u32, buffer, u32_const(0),
+                                         module.OpIAdd(u32_id, first, u32_const(line))))};
+        Id value{module.OpBitcast(f32_id, word)};
+        if (variable.value == position.value) {
+            value = module.OpSelect(f32_id, in_range, value, f32_zero);
+        }
+        module.OpStore(module.OpAccessChain(output_f32, variable, u32_const(element)), value);
+    }
+    module.OpReturn();
+    module.OpFunctionEnd();
+    module.AddEntryPoint(spv::ExecutionModel::Vertex, main, "main",
+                         std::span<const Id>(interfaces.data(), interfaces.size()));
+    return module.Assemble();
 }
 
 } // namespace Shader::Backend::SPIRV

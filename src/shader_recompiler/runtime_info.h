@@ -117,6 +117,11 @@ struct RuntimeInfo {
 
     /// Dual source blending
     bool dual_source_blend{};
+
+    /// Mesh program emitted as a compute shader for devices without VK_EXT_mesh_shader: the
+    /// epilogue appends its triangles to the fallback buffer (set 1, binding 0) for a
+    /// passthrough vertex shader (EmitMeshFallbackVertex) to draw.
+    bool mesh_fallback{};
 };
 
 } // namespace Shader

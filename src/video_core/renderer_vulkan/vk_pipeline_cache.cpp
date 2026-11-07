@@ -1501,38 +1501,45 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             layer_source_program = &programs[index];
         }
     }
+    // Fork (KVTADM): devices without VK_EXT_mesh_shader (RDNA1) run eligible mesh programs as
+    // compute shaders that append triangles to a buffer, drawn by a passthrough vertex shader.
+    bool mesh_fallback{};
+    const Shader::IR::Program* fallback_mesh_program{};
     if (mesh_without_support) {
-        // Fork (mesh fallback study): describe each task/mesh pipeline the device cannot build,
-        // then skip it as before.
+        bool has_task{};
+        for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
+            if (key.unique_hashes[index] == 0) {
+                continue;
+            }
+            if (programs[index].stage == Shader::Stage::Task) {
+                has_task = true;
+            } else if (programs[index].stage == Shader::Stage::Mesh) {
+                fallback_mesh_program = &programs[index];
+            }
+        }
+        const char* reason{};
+        if (has_task) {
+            reason = "task program";
+        } else if (!fallback_mesh_program) {
+            reason = "no mesh program";
+        } else if (fallback_mesh_program->mesh.topology != 4) {
+            reason = "not a triangle list";
+        } else if (!fallback_mesh_program->mesh.primitive_lines.empty()) {
+            reason = "per-primitive attributes";
+        } else if (fallback_mesh_program->mesh.vertex_lines.empty() ||
+                   fallback_mesh_program->mesh.max_primitives == 0 ||
+                   fallback_mesh_program->workgroup_size[0] == 0) {
+            reason = "empty mesh program";
+        }
         static std::atomic<u32> described{};
         if (described.fetch_add(1, std::memory_order_relaxed) < 300) {
-            std::string stages;
-            for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
-                if (key.unique_hashes[index] == 0) {
-                    continue;
-                }
-                const Shader::IR::Program& program{programs[index]};
-                const Shader::Info& info{program.info};
-                stages += fmt::format(
-                    " [{} {:016x} wg={}x{}x{} shared={} local={} cbufs={} ssbos={} tex={} img={}",
-                    static_cast<int>(program.stage), key.unique_hashes[index],
-                    program.workgroup_size[0], program.workgroup_size[1],
-                    program.workgroup_size[2], program.shared_memory_size,
-                    program.local_memory_size, info.constant_buffer_descriptors.size(),
-                    info.storage_buffers_descriptors.size(), info.texture_descriptors.size(),
-                    info.image_descriptors.size());
-                if (program.stage == Shader::Stage::Task || program.stage == Shader::Stage::Mesh) {
-                    const Shader::MeshInfo& mesh{program.mesh};
-                    stages += fmt::format(" payload={} maxv={} maxp={} topo={} vlines={} plines={}",
-                                          mesh.payload_words, mesh.max_vertices,
-                                          mesh.max_primitives, mesh.topology,
-                                          mesh.vertex_lines.size(), mesh.primitive_lines.size());
-                }
-                stages += "]";
-            }
-            LOG_WARNING(Render_Vulkan, "MeshFallback study: pipeline {:016x}{}", hash, stages);
+            LOG_WARNING(Render_Vulkan, "MeshFallback: pipeline {:016x} {}", hash,
+                        reason ? reason : "emulated");
         }
-        return nullptr;
+        if (reason) {
+            return nullptr;
+        }
+        mesh_fallback = true;
     }
     // A tessellation pipeline the driver would refuse is skipped like a missing mesh pipeline:
     // the draw is dropped (see the pipeline check in the rasterizer) instead of failing the build.
@@ -1606,9 +1613,10 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         const size_t stage_index{index - 1};
         infos[stage_index] = &program.info;
 
-        const auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage, device)};
+        auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage, device)};
+        runtime_info.mesh_fallback = mesh_fallback && program.stage == Shader::Stage::Mesh;
         ConvertLegacyToGeneric(program, runtime_info);
-        if (emit_pools) {
+        if (emit_pools && !mesh_fallback) {
             deferred_runtime_infos[stage_index] = runtime_info;
             if (VideoCommon::Nx2Perf::Verify()) {
                 reference_spirv[stage_index] = EmitSPIRV(profile, runtime_info, program, binding);
@@ -1623,8 +1631,17 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
         previous_stage = &program;
     }
+    MeshFallbackShader mesh_fallback_shader;
+    if (mesh_fallback) {
+        const Shader::MeshInfo& mesh{fallback_mesh_program->mesh};
+        mesh_fallback_shader.vertex =
+            BuildShader(device, Shader::Backend::SPIRV::EmitMeshFallbackVertex(profile, mesh));
+        mesh_fallback_shader.vertex_words = static_cast<u32>(mesh.vertex_lines.size());
+        mesh_fallback_shader.max_primitives = mesh.max_primitives;
+        mesh_fallback_shader.primitive_vertices = mesh.PrimitiveVertices();
+    }
     std::function<std::array<vk::ShaderModule, Maxwell::MaxShaderStage>()> emit_stages;
-    if (emit_pools) {
+    if (emit_pools && !mesh_fallback) {
         auto job = std::make_shared<DeferredStages>();
         job->reservation = std::move(reservation);
         job->pools = emit_pools;
@@ -1665,7 +1682,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     return std::make_unique<GraphicsPipeline>(
         scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, &shader_notify, device,
         descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring, thread_worker, statistics,
-        render_pass_cache, key, std::move(modules), infos, std::move(emit_stages));
+        render_pass_cache, key, std::move(modules), infos, std::move(emit_stages),
+        std::move(mesh_fallback_shader));
 
 } catch (const Shader::Exception& exception) {
     auto hash = key.Hash();

@@ -494,6 +494,7 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     DefineConstantBuffers(program.info, uniform_binding);
     DefineConstantBufferIndirectFunctions(program.info);
     DefineStorageBuffers(program.info, storage_binding);
+    DefineMeshFallbackBuffer();
     DefineTextureBuffers(program.info, texture_binding);
     DefineImageBuffers(program.info, image_binding);
     DefineTextures(program.info, texture_binding, bindings.texture_scaling_index);
@@ -1880,16 +1881,24 @@ void EmitContext::DefineMesh(const IR::Program& program) {
     if (stage != Stage::Task && stage != Stage::Mesh) {
         return;
     }
-    AddExtension("SPV_EXT_mesh_shader");
-    AddCapability(spv::Capability::MeshShadingEXT);
+    const bool fallback{runtime_info.mesh_fallback};
+    if (fallback && stage == Stage::Task) {
+        throw NotImplementedException("Task program in the mesh fallback");
+    }
+    if (!fallback) {
+        AddExtension("SPV_EXT_mesh_shader");
+        AddCapability(spv::Capability::MeshShadingEXT);
+    }
     mesh_info = program.mesh;
     mesh_threads = program.workgroup_size[0];
-    // The task's output region, which its mesh workgroups read as their input region.
+    // The task's output region, which its mesh workgroups read as their input region. The mesh
+    // fallback runs without a task program: the region stays in workgroup memory.
+    const spv::StorageClass payload_class{fallback ? spv::StorageClass::Workgroup
+                                                   : spv::StorageClass::TaskPayloadWorkgroupEXT};
     const Id payload_type{TypeArray(U32[1], Const(mesh_info.payload_words))};
-    mesh_payload = DefineVariable(*this, payload_type, std::nullopt,
-                                  spv::StorageClass::TaskPayloadWorkgroupEXT);
+    mesh_payload = DefineVariable(*this, payload_type, std::nullopt, payload_class);
     Name(mesh_payload, "task_payload");
-    mesh_payload_u32 = TypePointer(spv::StorageClass::TaskPayloadWorkgroupEXT, U32[1]);
+    mesh_payload_u32 = TypePointer(payload_class, U32[1]);
     if (stage == Stage::Task) {
         return;
     }
@@ -1912,6 +1921,13 @@ void EmitContext::DefineMesh(const IR::Program& program) {
     mesh_primitive_count =
         DefineVariable(*this, U32[1], std::nullopt, spv::StorageClass::Workgroup);
     Name(mesh_primitive_count, "isbe_primitive_count");
+    if (fallback) {
+        // No outputs: the epilogue writes the fallback buffer (DefineMeshFallbackBuffer).
+        mesh_fallback_base =
+            DefineVariable(*this, U32[1], std::nullopt, spv::StorageClass::Workgroup);
+        Name(mesh_fallback_base, "fallback_base");
+        return;
+    }
 
     const Id vertex_count{Const(mesh_info.max_vertices)};
     const Id primitive_count{Const(mesh_info.max_primitives)};
@@ -1991,6 +2007,33 @@ void EmitContext::DefineMesh(const IR::Program& program) {
     }
     for (const u32 line : mesh_info.primitive_lines) {
         mesh_primitive_targets.push_back(target(line, true));
+    }
+}
+
+void EmitContext::DefineMeshFallbackBuffer() {
+    if (!runtime_info.mesh_fallback || stage != Stage::Mesh) {
+        return;
+    }
+    AddExtension("SPV_KHR_storage_buffer_storage_class");
+    // Reuse the u32 storage buffer types when the program defined them: a second ArrayStride or
+    // Block decoration on the same (deduplicated) type is invalid.
+    StorageTypeDefinition& u32_types{storage_types.U32};
+    if (!Sirit::ValidId(u32_types.array)) {
+        const Id array_type{TypeRuntimeArray(U32[1])};
+        Decorate(array_type, spv::Decoration::ArrayStride, 4U);
+        const Id struct_type{TypeStruct(array_type)};
+        Decorate(struct_type, spv::Decoration::Block);
+        MemberDecorate(struct_type, 0, spv::Decoration::Offset, 0U);
+        u32_types.array = TypePointer(spv::StorageClass::StorageBuffer, struct_type);
+        u32_types.element = TypePointer(spv::StorageClass::StorageBuffer, U32[1]);
+    }
+    mesh_fallback_u32 = u32_types.element;
+    mesh_fallback_buffer = AddGlobalVariable(u32_types.array, spv::StorageClass::StorageBuffer);
+    Decorate(mesh_fallback_buffer, spv::Decoration::Binding, 0U);
+    Decorate(mesh_fallback_buffer, spv::Decoration::DescriptorSet, 1U);
+    Name(mesh_fallback_buffer, "mesh_fallback");
+    if (profile.supported_spirv >= 0x00010400) {
+        interfaces.push_back(mesh_fallback_buffer);
     }
 }
 

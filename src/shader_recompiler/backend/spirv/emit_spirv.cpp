@@ -294,6 +294,12 @@ void DefineEntryPoint(const IR::Program& program, EmitContext& ctx, Id main) {
                              1U);
         break;
     case Stage::Mesh:
+        if (ctx.runtime_info.mesh_fallback) {
+            execution_model = spv::ExecutionModel::GLCompute;
+            ctx.AddExecutionMode(main, spv::ExecutionMode::LocalSize, program.workgroup_size[0],
+                                 1U, 1U);
+            break;
+        }
         execution_model = spv::ExecutionModel::MeshEXT;
         ctx.AddExecutionMode(main, spv::ExecutionMode::LocalSize, program.workgroup_size[0], 1U,
                              1U);

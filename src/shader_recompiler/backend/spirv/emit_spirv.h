@@ -33,7 +33,19 @@ constexpr u32 RESCALING_LAYOUT_WORDS_OFFSET = offsetof(RescalingLayout, rescalin
 constexpr u32 RESCALING_LAYOUT_DOWN_FACTOR_OFFSET = offsetof(RescalingLayout, down_factor);
 constexpr u32 RENDERAREA_LAYOUT_OFFSET = offsetof(RenderAreaLayout, render_area);
 
+// Mesh fallback buffer (devices without VK_EXT_mesh_shader), one region per draw, in words: a
+// VkDrawIndirectCommand whose vertex count the mesh workgroups bump, the vertex capacity, then
+// the vertices of the triangle list (one word per stage buffer vertex line).
+constexpr u32 MESH_FALLBACK_CAPACITY_WORD = 4;
+constexpr u32 MESH_FALLBACK_HEADER_WORDS = 16;
+
 [[nodiscard]] std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info, IR::Program& program, Bindings& bindings);
+
+/// Vertex shader drawing the triangles a mesh program emitted in the mesh fallback: it reads
+/// vertex gl_VertexIndex from the fallback buffer (set 1, binding 0) into the outputs the mesh
+/// program would have written.
+[[nodiscard]] std::vector<u32> EmitMeshFallbackVertex(const Profile& profile,
+                                                      const MeshInfo& mesh);
 [[nodiscard]] inline std::vector<u32> EmitSPIRV(const Profile& profile, IR::Program& program) {
     Bindings binding;
     return EmitSPIRV(profile, {}, program, binding);

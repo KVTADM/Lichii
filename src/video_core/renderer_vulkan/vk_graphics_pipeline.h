@@ -69,11 +69,58 @@ struct hash<Vulkan::GraphicsPipelineCacheKey> {
 namespace Vulkan {
 
 class Device;
+class MemoryAllocator;
 class PipelineStatistics;
 class RenderPassCache;
 class RescalingPushConstant;
 class RenderAreaPushConstant;
 class Scheduler;
+
+/// Fork (KVTADM): the mesh fallback's per-draw buffer regions (devices without
+/// VK_EXT_mesh_shader). One device-local buffer cut into chunks reused once the GPU is done with
+/// them, bound through one dynamic storage buffer descriptor (set 1, binding 0).
+class MeshFallbackScratch {
+public:
+    static constexpr VkDeviceSize CHUNK_SIZE = 32ULL << 20;
+    static constexpr u32 NUM_CHUNKS = 4;
+
+    explicit MeshFallbackScratch(const Device& device, MemoryAllocator& memory_allocator,
+                                 Scheduler& scheduler);
+    ~MeshFallbackScratch();
+
+    /// Offset of `size` bytes for the current draw, or nothing when they exceed a chunk.
+    std::optional<u32> Allocate(VkDeviceSize size);
+
+    VkBuffer Buffer() const noexcept {
+        return *buffer;
+    }
+
+    VkDescriptorSet DescriptorSet() const noexcept {
+        return descriptor_set;
+    }
+
+    /// The layout of set 1 (pipeline layouts only need an identical one).
+    static vk::DescriptorSetLayout CreateSetLayout(const Device& device);
+
+private:
+    Scheduler& scheduler;
+    vk::Buffer buffer;
+    vk::DescriptorSetLayout set_layout;
+    vk::DescriptorPool descriptor_pool;
+    vk::DescriptorSets descriptor_sets;
+    VkDescriptorSet descriptor_set{};
+    std::array<u64, NUM_CHUNKS> chunk_ticks{};
+    u32 chunk{};
+    VkDeviceSize cursor{};
+};
+
+/// Fork (KVTADM): a mesh program the pipeline runs as a compute shader (mesh fallback).
+struct MeshFallbackShader {
+    vk::ShaderModule vertex;   ///< passthrough vertex shader (EmitMeshFallbackVertex)
+    u32 vertex_words{};        ///< words per emitted vertex
+    u32 max_primitives{};
+    u32 primitive_vertices{};
+};
 
 class GraphicsPipeline {
     static constexpr size_t NUM_STAGES = Tegra::Engines::Maxwell3D::Regs::MaxShaderStage;
@@ -88,7 +135,8 @@ public:
         PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
         const GraphicsPipelineCacheKey& key, std::array<vk::ShaderModule, NUM_STAGES> stages,
         const std::array<const Shader::Info*, NUM_STAGES>& infos,
-        std::function<std::array<vk::ShaderModule, NUM_STAGES>()> emit_stages = {});
+        std::function<std::array<vk::ShaderModule, NUM_STAGES>()> emit_stages = {},
+        MeshFallbackShader mesh_fallback = {});
 
     static std::chrono::nanoseconds TakeHoldTime() noexcept;
 
@@ -135,6 +183,14 @@ public:
     [[nodiscard]] bool IsMeshPipeline() const noexcept {
         return stage_infos[0].is_task || stage_infos[0].is_mesh;
     }
+
+    /// Mesh pipeline emulated with a compute shader and a passthrough vertex shader.
+    [[nodiscard]] bool HasMeshFallback() const noexcept {
+        return has_mesh_fallback;
+    }
+
+    /// Records a mesh fallback draw of `groups` mesh workgroups (after Configure).
+    void RecordMeshFallback(u32 groups, MeshFallbackScratch& scratch);
     GraphicsPipeline& operator=(GraphicsPipeline&&) noexcept = delete;
     GraphicsPipeline(GraphicsPipeline&&) noexcept = delete;
 
@@ -254,6 +310,17 @@ private:
     VkDeviceSize last_descriptor_buffer_offset{};
     u32 last_descriptor_buffer_chunk{};
     u64 last_descriptor_buffer_generation{};
+
+    // Mesh fallback (fork): the mesh program as a compute pipeline sharing the layout, which adds
+    // set 1 (the fallback buffer); the last guest descriptors, to bind them for the dispatch too.
+    MeshFallbackShader mesh_fallback;
+    bool has_mesh_fallback{};
+    vk::DescriptorSetLayout fallback_set_layout;
+    vk::DescriptorSetLayout fallback_guest_set_layout; ///< empty set 0 when the guest has none
+    vk::DescriptorUpdateTemplate fallback_compute_template;
+    vk::Pipeline fallback_compute;
+    const void* last_descriptor_data{};
+    VkDescriptorSet last_descriptor_set{};
 
     const bool worker_only_build;
     bool uses_push_descriptor{false};

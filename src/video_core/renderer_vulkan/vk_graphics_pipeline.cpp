@@ -17,6 +17,7 @@
 #include "video_core/renderer_vulkan/pipeline_build_trace.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 
+#include "common/alignment.h"
 #include "common/bit_field.h"
 #include "common/scope_exit.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
@@ -32,6 +33,7 @@
 #include "video_core/shader_notify.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/vulkan_common/vulkan_device.h"
+#include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "common/settings.h"
 #include "shader_recompiler/exception.h"
@@ -71,7 +73,8 @@ VkShaderStageFlagBits StageFlag(const Shader::Info& info, VkShaderStageFlagBits 
     return slot_stage;
 }
 
-DescriptorLayoutBuilder MakeBuilder(const Device& device, std::span<const Shader::Info> infos) {
+DescriptorLayoutBuilder MakeBuilder(const Device& device, std::span<const Shader::Info> infos,
+                                    bool mesh_fallback = false) {
     DescriptorLayoutBuilder builder{device};
     for (size_t index = 0; index < infos.size(); ++index) {
         static constexpr std::array stages{
@@ -81,7 +84,8 @@ DescriptorLayoutBuilder MakeBuilder(const Device& device, std::span<const Shader
             VK_SHADER_STAGE_GEOMETRY_BIT,
             VK_SHADER_STAGE_FRAGMENT_BIT,
         };
-        builder.Add(infos[index], StageFlag(infos[index], stages.at(index)));
+        builder.Add(infos[index], mesh_fallback ? MESH_FALLBACK_STAGES
+                                                : StageFlag(infos[index], stages.at(index)));
     }
     return builder;
 }
@@ -282,7 +286,8 @@ GraphicsPipeline::GraphicsPipeline(
     PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
     const GraphicsPipelineCacheKey& key_, std::array<vk::ShaderModule, NUM_STAGES> stages,
     const std::array<const Shader::Info*, NUM_STAGES>& infos,
-    std::function<std::array<vk::ShaderModule, NUM_STAGES>()> emit_stages)
+    std::function<std::array<vk::ShaderModule, NUM_STAGES>()> emit_stages,
+    MeshFallbackShader mesh_fallback_)
     : key{key_}, device{device_}, texture_cache{texture_cache_}, buffer_cache{buffer_cache_},
       pipeline_cache(pipeline_cache_), scheduler{scheduler_},
       guest_descriptor_queue{guest_descriptor_queue_},
@@ -291,6 +296,8 @@ GraphicsPipeline::GraphicsPipeline(
     if (shader_notify) {
         shader_notify->MarkShaderBuilding();
     }
+    has_mesh_fallback = static_cast<bool>(mesh_fallback_.vertex);
+    mesh_fallback = std::move(mesh_fallback_);
     for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
         const Shader::Info* const info{infos[stage]};
         if (!info) {
@@ -321,9 +328,12 @@ GraphicsPipeline::GraphicsPipeline(
                any_written(info.image_descriptors) || any_written(info.image_buffer_descriptors);
     });
 
-    DescriptorLayoutBuilder builder{MakeBuilder(device, stage_infos)};
+    DescriptorLayoutBuilder builder{MakeBuilder(device, stage_infos, has_mesh_fallback)};
     uses_push_descriptor = builder.CanUsePushDescriptor();
-    uses_descriptor_buffer = builder.CanUseDescriptorBuffer() && descriptor_buffer_ring.IsValid();
+    // The mesh fallback binds a regular set next to the guest one, which descriptor buffers
+    // cannot mix with.
+    uses_descriptor_buffer = !has_mesh_fallback && builder.CanUseDescriptorBuffer() &&
+                             descriptor_buffer_ring.IsValid();
     descriptor_set_layout =
         builder.CreateDescriptorSetLayout(uses_push_descriptor, uses_descriptor_buffer);
     if (uses_descriptor_buffer) {
@@ -340,10 +350,32 @@ GraphicsPipeline::GraphicsPipeline(
     }
 
     const VkDescriptorSetLayout set_layout{*descriptor_set_layout};
-    pipeline_layout = builder.CreatePipelineLayout(set_layout);
+    if (has_mesh_fallback) {
+        fallback_set_layout = MeshFallbackScratch::CreateSetLayout(device);
+        if (!descriptor_set_layout) {
+            // Set 1 needs a set 0 before it.
+            fallback_guest_set_layout = device.GetLogical().CreateDescriptorSetLayout({
+                .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .bindingCount = 0,
+                .pBindings = nullptr,
+            });
+        }
+        pipeline_layout = builder.CreateMeshFallbackPipelineLayout(
+            set_layout ? set_layout : *fallback_guest_set_layout, *fallback_set_layout);
+    } else {
+        pipeline_layout = builder.CreatePipelineLayout(set_layout);
+    }
     if (!uses_descriptor_buffer) {
-        descriptor_update_template =
-            builder.CreateTemplate(set_layout, *pipeline_layout, uses_push_descriptor);
+        const std::optional<VkPipelineBindPoint> bind_point{
+            has_mesh_fallback ? std::optional{VK_PIPELINE_BIND_POINT_GRAPHICS} : std::nullopt};
+        descriptor_update_template = builder.CreateTemplate(set_layout, *pipeline_layout,
+                                                            uses_push_descriptor, bind_point);
+        if (has_mesh_fallback && uses_push_descriptor) {
+            fallback_compute_template = builder.CreateTemplate(
+                set_layout, *pipeline_layout, true, VK_PIPELINE_BIND_POINT_COMPUTE);
+        }
         if (!uses_push_descriptor) {
             descriptor_allocator =
                 descriptor_pool.Allocator(device, scheduler, set_layout, stage_infos);
@@ -768,7 +800,9 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         });
     }
     const bool is_rescaling{texture_cache.IsRescaling()};
-    const bool update_rescaling{scheduler.UpdateRescaling(is_rescaling, IsMeshPipeline())};
+    // The mesh fallback's push constant range covers more stages than the others: always push.
+    const bool update_rescaling{scheduler.UpdateRescaling(is_rescaling, IsMeshPipeline()) ||
+                                has_mesh_fallback};
     const bool bind_pipeline{scheduler.UpdateGraphicsPipeline(this)};
     const bool bind_descriptor_buffer{
         descriptor_set_layout && uses_descriptor_buffer &&
@@ -810,9 +844,10 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline);
         }
         const VkShaderStageFlags push_stages =
-            IsMeshPipeline() ? VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_TASK_BIT_EXT |
-                                   VK_SHADER_STAGE_MESH_BIT_EXT
-                             : VK_SHADER_STAGE_ALL_GRAPHICS;
+            has_mesh_fallback ? MESH_FALLBACK_STAGES
+            : IsMeshPipeline() ? VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_TASK_BIT_EXT |
+                                     VK_SHADER_STAGE_MESH_BIT_EXT
+                               : VK_SHADER_STAGE_ALL_GRAPHICS;
         cmdbuf.PushConstants(*pipeline_layout, push_stages, RESCALING_LAYOUT_WORDS_OFFSET,
                              sizeof(rescaling_data), rescaling_data.data());
         if (update_rescaling) {
@@ -836,19 +871,200 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         } else if (uses_push_descriptor) {
             cmdbuf.PushDescriptorSetWithTemplateKHR(*descriptor_update_template, *pipeline_layout,
                                                     0, descriptor_data);
+            last_descriptor_data = descriptor_data;
         } else if (update_descriptors) {
             const VkDescriptorSet descriptor_set{descriptor_allocator.Commit()};
             const vk::Device& dev{device.GetLogical()};
             dev.UpdateDescriptorSet(descriptor_set, *descriptor_update_template, descriptor_data);
             cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout, 0,
                                       descriptor_set, nullptr);
+            last_descriptor_set = descriptor_set;
         }
     });
     return true;
 }
 
+void GraphicsPipeline::RecordMeshFallback(u32 groups, MeshFallbackScratch& scratch) {
+    if (groups == 0 || !has_mesh_fallback) {
+        return;
+    }
+    using Shader::Backend::SPIRV::MESH_FALLBACK_HEADER_WORDS;
+    const u64 capacity{u64{groups} * mesh_fallback.max_primitives *
+                       mesh_fallback.primitive_vertices};
+    const u64 size{(MESH_FALLBACK_HEADER_WORDS + capacity * mesh_fallback.vertex_words) *
+                   sizeof(u32)};
+    const std::optional<u32> offset{capacity <= 0xffffffffULL ? scratch.Allocate(size)
+                                                              : std::nullopt};
+    if (!offset) {
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 20) {
+            LOG_WARNING(Render_Vulkan,
+                        "MeshFallback: draw of {} workgroups needs {} bytes, more than a chunk",
+                        groups, size);
+        }
+        return;
+    }
+    const VkBuffer buffer{scratch.Buffer()};
+    const VkDescriptorSet fallback_set{scratch.DescriptorSet()};
+    // The dispatch runs outside the render pass, then the draw resumes it.
+    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.Record([this, groups, buffer, fallback_set, offset = *offset,
+                      capacity = static_cast<u32>(capacity)](vk::CommandBuffer cmdbuf) {
+        if (scheduler.GraphicsPipelineMissing() || !fallback_compute) {
+            return;
+        }
+        // VkDrawIndirectCommand{0, 1, 0, 0}, then the vertex capacity.
+        cmdbuf.FillBuffer(buffer, offset, 4, 0);
+        cmdbuf.FillBuffer(buffer, offset + 4, 4, 1);
+        cmdbuf.FillBuffer(buffer, offset + 8, 8, 0);
+        cmdbuf.FillBuffer(buffer, offset + Shader::Backend::SPIRV::MESH_FALLBACK_CAPACITY_WORD * 4,
+                          4, capacity);
+        const VkMemoryBarrier fill_barrier{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, fill_barrier);
+        cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *fallback_compute);
+        if (descriptor_set_layout) {
+            if (uses_push_descriptor) {
+                if (fallback_compute_template && last_descriptor_data) {
+                    cmdbuf.PushDescriptorSetWithTemplateKHR(*fallback_compute_template,
+                                                            *pipeline_layout, 0,
+                                                            last_descriptor_data);
+                }
+            } else if (last_descriptor_set) {
+                cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline_layout, 0,
+                                          last_descriptor_set, {});
+            }
+        }
+        cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline_layout, 1,
+                                  fallback_set, offset);
+        cmdbuf.Dispatch(groups, 1, 1);
+        const VkMemoryBarrier output_barrier{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                               VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                                   VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+                               0, output_barrier);
+    });
+    scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
+    scheduler.Record([this, buffer, fallback_set, offset = *offset](vk::CommandBuffer cmdbuf) {
+        if (scheduler.GraphicsPipelineMissing() || !fallback_compute) {
+            return;
+        }
+        cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout, 1,
+                                  fallback_set, offset);
+        cmdbuf.DrawIndirect(buffer, offset, 1, 0);
+    });
+}
+
+MeshFallbackScratch::MeshFallbackScratch(const Device& device, MemoryAllocator& memory_allocator,
+                                         Scheduler& scheduler_)
+    : scheduler{scheduler_} {
+    // One chunk of slack past the last one: a descriptor spans a chunk from any offset.
+    buffer = memory_allocator.CreateBuffer(
+        VkBufferCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .size = CHUNK_SIZE * (NUM_CHUNKS + 1),
+            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
+                     VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .queueFamilyIndexCount = 0,
+            .pQueueFamilyIndices = nullptr,
+        },
+        MemoryUsage::DeviceLocal);
+    set_layout = CreateSetLayout(device);
+    const VkDescriptorPoolSize pool_size{
+        .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC,
+        .descriptorCount = 1,
+    };
+    descriptor_pool = device.GetLogical().CreateDescriptorPool({
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .maxSets = 1,
+        .poolSizeCount = 1,
+        .pPoolSizes = &pool_size,
+    });
+    const VkDescriptorSetLayout layout{*set_layout};
+    descriptor_sets = descriptor_pool.Allocate({
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .pNext = nullptr,
+        .descriptorPool = *descriptor_pool,
+        .descriptorSetCount = 1,
+        .pSetLayouts = &layout,
+    });
+    descriptor_set = descriptor_sets[0];
+    const VkDescriptorBufferInfo buffer_info{
+        .buffer = *buffer,
+        .offset = 0,
+        .range = CHUNK_SIZE,
+    };
+    const VkWriteDescriptorSet write{
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .pNext = nullptr,
+        .dstSet = descriptor_set,
+        .dstBinding = 0,
+        .dstArrayElement = 0,
+        .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC,
+        .pImageInfo = nullptr,
+        .pBufferInfo = &buffer_info,
+        .pTexelBufferView = nullptr,
+    };
+    device.GetLogical().UpdateDescriptorSets(write, {});
+    LOG_INFO(Render_Vulkan, "MeshFallback: {} MiB buffer for mesh programs without "
+             "VK_EXT_mesh_shader", (CHUNK_SIZE * (NUM_CHUNKS + 1)) >> 20);
+}
+
+MeshFallbackScratch::~MeshFallbackScratch() = default;
+
+vk::DescriptorSetLayout MeshFallbackScratch::CreateSetLayout(const Device& device) {
+    const VkDescriptorSetLayoutBinding binding{
+        .binding = 0,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC,
+        .descriptorCount = 1,
+        .stageFlags = MESH_FALLBACK_STAGES,
+        .pImmutableSamplers = nullptr,
+    };
+    return device.GetLogical().CreateDescriptorSetLayout({
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .bindingCount = 1,
+        .pBindings = &binding,
+    });
+}
+
+std::optional<u32> MeshFallbackScratch::Allocate(VkDeviceSize size) {
+    size = Common::AlignUp(size, 256);
+    if (size > CHUNK_SIZE) {
+        return std::nullopt;
+    }
+    if (cursor + size > CHUNK_SIZE) {
+        // Next chunk, once the GPU is done with its last use.
+        chunk_ticks[chunk] = scheduler.CurrentTick();
+        chunk = (chunk + 1) % NUM_CHUNKS;
+        cursor = 0;
+        scheduler.Wait(chunk_ticks[chunk]);
+    }
+    const VkDeviceSize offset{chunk * CHUNK_SIZE + cursor};
+    cursor += size;
+    chunk_ticks[chunk] = scheduler.CurrentTick();
+    return static_cast<u32>(offset);
+}
+
 void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
-    if (IsMeshPipeline() && !device.IsExtMeshShaderSupported()) {
+    if (IsMeshPipeline() && !device.IsExtMeshShaderSupported() && !has_mesh_fallback) {
         return;
     }
     FixedPipelineState::DynamicState dynamic{};
@@ -1239,6 +1455,20 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         if (!spv_modules[stage]) {
             continue;
         }
+        if (has_mesh_fallback && stage == 0) {
+            // The mesh program runs as a compute shader (below); its triangles are drawn by the
+            // passthrough vertex shader.
+            shader_stages.emplace_back(VkPipelineShaderStageCreateInfo{
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .stage = VK_SHADER_STAGE_VERTEX_BIT,
+                .module = *mesh_fallback.vertex,
+                .pName = "main",
+                .pSpecializationInfo = nullptr,
+            });
+            continue;
+        }
         const Shader::Info& info{stage_infos[stage]};
         const VkShaderStageFlagBits stage_flag{
             StageFlag(info, MaxwellToVK::ShaderStage(Shader::StageFromIndex(stage)))};
@@ -1266,6 +1496,29 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
     }
 
+    // Mesh fallback: no vertex buffers, a triangle list.
+    const VkPipelineVertexInputStateCreateInfo fallback_vertex_input_ci{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .vertexBindingDescriptionCount = 0,
+        .pVertexBindingDescriptions = nullptr,
+        .vertexAttributeDescriptionCount = 0,
+        .pVertexAttributeDescriptions = nullptr,
+    };
+    const VkPipelineInputAssemblyStateCreateInfo fallback_input_assembly_ci{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+        .primitiveRestartEnable = VK_FALSE,
+    };
+    const VkPipelineVertexInputStateCreateInfo* const vertex_input_state{
+        has_mesh_fallback ? &fallback_vertex_input_ci : is_mesh ? nullptr : &vertex_input_ci};
+    const VkPipelineInputAssemblyStateCreateInfo* const input_assembly_state{
+        has_mesh_fallback ? &fallback_input_assembly_ci
+                          : is_mesh ? nullptr : &input_assembly_ci};
+
     const bool unoptimized = (flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT) != 0;
     const auto trace_begin = std::chrono::steady_clock::now();
     TracePipelineBuild("BEGIN", "graphics", key.Hash(), key.unique_hashes, unoptimized);
@@ -1275,8 +1528,8 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         .flags = flags,
         .stageCount = static_cast<u32>(shader_stages.size()),
         .pStages = shader_stages.data(),
-        .pVertexInputState = is_mesh ? nullptr : &vertex_input_ci,
-        .pInputAssemblyState = is_mesh ? nullptr : &input_assembly_ci,
+        .pVertexInputState = vertex_input_state,
+        .pInputAssemblyState = input_assembly_state,
         .pTessellationState = is_mesh ? nullptr : &tessellation_ci,
         .pViewportState = &viewport_ci,
         .pRasterizationState = &rasterization_ci,
@@ -1294,6 +1547,39 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
                        std::chrono::duration<double, std::milli>(
                            std::chrono::steady_clock::now() - trace_begin)
                            .count());
+
+    if (has_mesh_fallback) {
+        const Shader::Info& info{stage_infos[0]};
+        const bool uses_warp_ops = info.uses_subgroup_vote || info.uses_subgroup_invocation_id ||
+                                   info.uses_subgroup_shuffles || info.uses_subgroup_mask;
+        const bool force_warp_size =
+            uses_warp_ops && device.IsExtSubgroupSizeControlSupported() &&
+            device.IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT);
+        fallback_compute = device.GetLogical().CreateComputePipeline(
+            {
+                .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .stage{
+                    .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                    .pNext = force_warp_size ? &subgroup_size_ci : nullptr,
+                    .flags = 0,
+                    .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                    .module = *spv_modules[0],
+                    .pName = "main",
+                    .pSpecializationInfo = nullptr,
+                },
+                .layout = *pipeline_layout,
+                .basePipelineHandle = nullptr,
+                .basePipelineIndex = 0,
+            },
+            *pipeline_cache);
+        mesh_fallback.vertex.reset();
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 100) {
+            LOG_INFO(Render_Vulkan, "MeshFallback: built pipeline {:016x}", key.Hash());
+        }
+    }
 
     // Log graphics pipeline creation
     if (GPU::Logging::IsActive()) {

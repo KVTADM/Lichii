@@ -143,6 +143,11 @@ inline void WriteDescriptorBuffer(const Device& device, const DescriptorBufferLa
            Shader::NumDescriptors(info.image_descriptors);
 }
 
+/// Mesh fallback (fork): the stages of its layouts, the vertex and fragment shaders and the
+/// mesh program run as a compute shader.
+constexpr VkShaderStageFlags MESH_FALLBACK_STAGES =
+    VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_COMPUTE_BIT;
+
 class DescriptorLayoutBuilder {
 public:
     DescriptorLayoutBuilder(const Device& device_) : device{&device_} {}
@@ -220,7 +225,8 @@ public:
 
     vk::DescriptorUpdateTemplate CreateTemplate(VkDescriptorSetLayout descriptor_set_layout,
                                                 VkPipelineLayout pipeline_layout,
-                                                bool use_push_descriptor) const {
+                                                bool use_push_descriptor,
+                                                std::optional<VkPipelineBindPoint> bind_point = {}) const {
         if (entries.empty()) {
             return nullptr;
         }
@@ -235,8 +241,9 @@ public:
             .pDescriptorUpdateEntries = entries.data(),
             .templateType = type,
             .descriptorSetLayout = descriptor_set_layout,
-            .pipelineBindPoint =
-                is_compute ? VK_PIPELINE_BIND_POINT_COMPUTE : VK_PIPELINE_BIND_POINT_GRAPHICS,
+            .pipelineBindPoint = bind_point ? *bind_point
+                                 : is_compute ? VK_PIPELINE_BIND_POINT_COMPUTE
+                                              : VK_PIPELINE_BIND_POINT_GRAPHICS,
             .pipelineLayout = pipeline_layout,
             .set = 0,
         });
@@ -263,6 +270,31 @@ public:
             .flags = 0,
             .setLayoutCount = descriptor_set_layout ? 1U : 0U,
             .pSetLayouts = bindings.empty() ? nullptr : &descriptor_set_layout,
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &range,
+        });
+    }
+
+    /// Mesh fallback (fork): the guest set, then the fallback buffer set, every stage (the mesh
+    /// program runs as a compute shader).
+    vk::PipelineLayout CreateMeshFallbackPipelineLayout(VkDescriptorSetLayout guest_set_layout,
+                                                        VkDescriptorSetLayout fallback_set_layout) const {
+        using Shader::Backend::SPIRV::RenderAreaLayout;
+        using Shader::Backend::SPIRV::RescalingLayout;
+        const VkPushConstantRange range{
+            .stageFlags = MESH_FALLBACK_STAGES,
+            .offset = 0,
+            .size = static_cast<u32>(sizeof(RescalingLayout)) +
+                    static_cast<u32>(sizeof(RenderAreaLayout)),
+        };
+        const std::array<VkDescriptorSetLayout, 2> set_layouts{guest_set_layout,
+                                                               fallback_set_layout};
+        return device->GetLogical().CreatePipelineLayout({
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .setLayoutCount = static_cast<u32>(set_layouts.size()),
+            .pSetLayouts = set_layouts.data(),
             .pushConstantRangeCount = 1,
             .pPushConstantRanges = &range,
         });
