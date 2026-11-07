@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -904,12 +905,34 @@ void GraphicsPipeline::RecordMeshFallback(u32 groups, MeshFallbackScratch& scrat
         }
         return;
     }
-    // EDEN_NX2_MESH_FALLBACK=dispatch runs the compute shaders without drawing (to tell a GPU
-    // fault in them from one in the draw).
-    static const bool dispatch_only{[] {
+    // Debug modes, to find what faults: EDEN_NX2_MESH_FALLBACK (at start) or the first letter of
+    // the file EDEN_NX2_MESH_FALLBACK_MODE_FILE (read every 256 draws, so it can change in game):
+    // d = dispatch only, b = also bind the draw's set, t = draw one triangle directly instead of
+    // the indirect draw, s = skip the draw entirely (no dispatch either), anything else = full.
+    static char mode{[] {
         const char* const value{std::getenv("EDEN_NX2_MESH_FALLBACK")};
-        return value != nullptr && value[0] == 'd';
+        return value != nullptr && value[0] != 0 ? value[0] : 'f';
     }()};
+    static const char* const mode_file{std::getenv("EDEN_NX2_MESH_FALLBACK_MODE_FILE")};
+    static u32 mode_check{};
+    if (mode_file && (mode_check++ % 256) == 0) {
+        char read_mode{'f'};
+        if (std::FILE* const file{std::fopen(mode_file, "rb")}) {
+            const int value{std::fgetc(file)};
+            if (value != EOF) {
+                read_mode = static_cast<char>(value);
+            }
+            std::fclose(file);
+        }
+        if (read_mode != mode) {
+            LOG_INFO(Render_Vulkan, "MeshFallback: mode {}", read_mode);
+            mode = read_mode;
+        }
+    }
+    if (mode == 's') {
+        return;
+    }
+    const bool dispatch_only{mode == 'd'};
     static std::atomic<u32> logged_draws{};
     if (logged_draws.fetch_add(1, std::memory_order_relaxed) < 40) {
         LOG_INFO(Render_Vulkan,
@@ -970,12 +993,20 @@ void GraphicsPipeline::RecordMeshFallback(u32 groups, MeshFallbackScratch& scrat
     if (dispatch_only) {
         return;
     }
-    scheduler.Record([this, buffer, fallback_set, offset = *offset](vk::CommandBuffer cmdbuf) {
+    scheduler.Record([this, buffer, fallback_set, offset = *offset,
+                      draw_mode = mode](vk::CommandBuffer cmdbuf) {
         if (scheduler.GraphicsPipelineMissing() || !fallback_compute) {
             return;
         }
         cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout, 1,
                                   fallback_set, offset);
+        if (draw_mode == 'b') {
+            return;
+        }
+        if (draw_mode == 't') {
+            cmdbuf.Draw(3, 1, 0, 0);
+            return;
+        }
         cmdbuf.DrawIndirect(buffer, offset, 1, 0);
     });
 }
