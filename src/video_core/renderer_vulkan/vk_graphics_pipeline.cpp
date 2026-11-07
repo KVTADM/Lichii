@@ -1051,11 +1051,20 @@ std::optional<u32> MeshFallbackScratch::Allocate(VkDeviceSize size) {
         return std::nullopt;
     }
     if (cursor + size > CHUNK_SIZE) {
-        // Next chunk, once the GPU is done with its last use.
+        // Next chunk, if the GPU is done with its last use. Never wait here: the draw holds the
+        // buffer and texture cache locks, and a flush from here can deadlock the GPU thread. A
+        // draw without room is skipped instead.
+        const u32 next{(chunk + 1) % NUM_CHUNKS};
+        if (!scheduler.IsFree(chunk_ticks[next])) {
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 20) {
+                LOG_WARNING(Render_Vulkan, "MeshFallback: buffer full, draw skipped");
+            }
+            return std::nullopt;
+        }
         chunk_ticks[chunk] = scheduler.CurrentTick();
-        chunk = (chunk + 1) % NUM_CHUNKS;
+        chunk = next;
         cursor = 0;
-        scheduler.Wait(chunk_ticks[chunk]);
     }
     const VkDeviceSize offset{chunk * CHUNK_SIZE + cursor};
     cursor += size;

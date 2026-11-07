@@ -82,7 +82,7 @@ class Scheduler;
 class MeshFallbackScratch {
 public:
     static constexpr VkDeviceSize CHUNK_SIZE = 32ULL << 20;
-    static constexpr u32 NUM_CHUNKS = 4;
+    static constexpr u32 NUM_CHUNKS = 8;
 
     explicit MeshFallbackScratch(const Device& device, MemoryAllocator& memory_allocator,
                                  Scheduler& scheduler);
