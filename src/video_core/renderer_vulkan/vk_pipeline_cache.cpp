@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -341,6 +342,20 @@ void AddRuntimeSpirvTime(size_t thread, std::chrono::steady_clock::time_point be
         std::memory_order::relaxed);
 }
 
+// Fork: EDEN_NX2_MESH_FALLBACK_DUMP=<directory> writes the mesh fallback's SPIR-V there.
+thread_local bool dump_mesh_fallback_stages{};
+
+void DumpMeshFallbackSpirv(std::string_view name, std::span<const u32> code) {
+    static const char* const directory{std::getenv("EDEN_NX2_MESH_FALLBACK_DUMP")};
+    if (directory == nullptr || directory[0] == 0) {
+        return;
+    }
+    std::ofstream file{std::filesystem::path{directory} / std::string{name},
+                       std::ios::binary | std::ios::trunc};
+    file.write(reinterpret_cast<const char*>(code.data()),
+               static_cast<std::streamsize>(code.size_bytes()));
+}
+
 vk::ShaderModule EmitShaderModule(const Device& device, const Shader::Profile& profile,
                                  const Shader::RuntimeInfo& runtime_info,
                                  Shader::IR::Program& program, Shader::Backend::Bindings& binding,
@@ -349,6 +364,11 @@ vk::ShaderModule EmitShaderModule(const Device& device, const Shader::Profile& p
     const auto code =
         EmitPipelineShader(profile, runtime_info, program, binding, shader_hash, reference);
     device.SaveShader(code);
+    if (dump_mesh_fallback_stages) {
+        DumpMeshFallbackSpirv(fmt::format("mesh_fallback_{:016x}_{}.spv", shader_hash,
+                                          runtime_info.mesh_fallback ? "cs" : "fs"),
+                              code);
+    }
     vk::ShaderModule module{BuildShader(device, code)};
 
     // Text log + .spv dump. Text log is gated by gpu_log_level != Off; .spv dump
@@ -1622,6 +1642,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
 
         auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage, device)};
         runtime_info.mesh_fallback = mesh_fallback && program.stage == Shader::Stage::Mesh;
+        dump_mesh_fallback_stages = mesh_fallback;
         ConvertLegacyToGeneric(program, runtime_info);
         if (emit_pools && !mesh_fallback) {
             deferred_runtime_infos[stage_index] = runtime_info;
@@ -1638,11 +1659,14 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
         previous_stage = &program;
     }
+    dump_mesh_fallback_stages = false;
     MeshFallbackShader mesh_fallback_shader;
     if (mesh_fallback) {
         const Shader::MeshInfo& mesh{fallback_mesh_program->mesh};
-        mesh_fallback_shader.vertex =
-            BuildShader(device, Shader::Backend::SPIRV::EmitMeshFallbackVertex(profile, mesh));
+        const std::vector<u32> vertex_code{
+            Shader::Backend::SPIRV::EmitMeshFallbackVertex(profile, mesh)};
+        DumpMeshFallbackSpirv(fmt::format("mesh_fallback_{:016x}_vs.spv", hash), vertex_code);
+        mesh_fallback_shader.vertex = BuildShader(device, vertex_code);
         mesh_fallback_shader.vertex_words = static_cast<u32>(mesh.vertex_lines.size());
         mesh_fallback_shader.max_primitives = mesh.max_primitives;
         mesh_fallback_shader.primitive_vertices = mesh.PrimitiveVertices();
