@@ -9,6 +9,8 @@
 #include <chrono>
 #include <cstddef>
 #include <filesystem>
+
+#include <fmt/ranges.h>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -1560,8 +1562,12 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
         static std::atomic<u32> described{};
         if (described.fetch_add(1, std::memory_order_relaxed) < 300) {
-            LOG_WARNING(Render_Vulkan, "MeshFallback: pipeline {:016x} {}", hash,
-                        reason ? reason : "emulated");
+            LOG_WARNING(Render_Vulkan, "MeshFallback: pipeline {:016x} {} lines={}", hash,
+                        reason ? reason : "emulated",
+                        fallback_mesh_program
+                            ? fmt::format("{}", fmt::join(fallback_mesh_program->mesh.vertex_lines,
+                                                          ","))
+                            : std::string{});
         }
         if (reason) {
             return nullptr;

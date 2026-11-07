@@ -1168,11 +1168,17 @@ void MeshFallbackScratch::PollReadback() {
         std::array<u32, READBACK_BYTES / 4> words{};
         std::memcpy(words.data(), readback.Mapped().data() + slot * READBACK_BYTES,
                     READBACK_BYTES);
+        std::string vertices;
+        for (u32 word = 16; word < words.size(); ++word) {
+            f32 value;
+            std::memcpy(&value, &words[word], sizeof(value));
+            vertices += fmt::format(" {:.3g}", value);
+        }
         LOG_INFO(Render_Vulkan,
                  "MeshFallback: readback {:016x} groups={} capacity={} -> draw {{{}, {}, {}, {}}} "
-                 "capacity word {} debug word {}",
+                 "capacity word {} debug word {} vertex words:{}",
                  entry.hash, entry.groups, entry.capacity, words[0], words[1], words[2], words[3],
-                 words[4], words[5]);
+                 words[4], words[5], vertices);
     }
 }
 

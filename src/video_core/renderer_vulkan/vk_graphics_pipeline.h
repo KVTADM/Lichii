@@ -109,7 +109,7 @@ public:
         return *readback;
     }
 
-    static constexpr u32 READBACK_BYTES = 32;
+    static constexpr u32 READBACK_BYTES = 256;
 
 private:
     void PollReadback();
