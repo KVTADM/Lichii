@@ -945,7 +945,11 @@ void GraphicsPipeline::RecordMeshFallback(u32 groups, MeshFallbackScratch& scrat
     scheduler.RequestOutsideRenderPassOperationContext();
     // z: draw, but the vertex shader collapses every triangle (nothing rasterized).
     const bool collapse{mode == 'z'};
+    const std::optional<u32> readback_offset{
+        scratch.ReserveReadback(key.Hash(), groups, static_cast<u32>(capacity))};
+    const VkBuffer readback_buffer{scratch.ReadbackBuffer()};
     scheduler.Record([this, groups, buffer, fallback_set, offset = *offset, collapse,
+                      readback_offset, readback_buffer,
                       capacity = static_cast<u32>(capacity)](vk::CommandBuffer cmdbuf) {
         if (scheduler.GraphicsPipelineMissing() || !fallback_compute) {
             return;
@@ -992,6 +996,30 @@ void GraphicsPipeline::RecordMeshFallback(u32 groups, MeshFallbackScratch& scrat
                                VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
                                    VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
                                0, output_barrier);
+        if (readback_offset) {
+            const VkMemoryBarrier copy_barrier{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            };
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT, 0, copy_barrier);
+            const VkBufferCopy copy{
+                .srcOffset = offset,
+                .dstOffset = *readback_offset,
+                .size = MeshFallbackScratch::READBACK_BYTES,
+            };
+            cmdbuf.CopyBuffer(buffer, readback_buffer, copy);
+            const VkMemoryBarrier host_barrier{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+            };
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
+                                   host_barrier);
+        }
     });
     scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
     if (dispatch_only) {
@@ -1054,6 +1082,18 @@ MeshFallbackScratch::MeshFallbackScratch(const Device& device, MemoryAllocator& 
         .pSetLayouts = &layout,
     });
     descriptor_set = descriptor_sets[0];
+    readback = memory_allocator.CreateBuffer(
+        VkBufferCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .size = READBACK_BYTES * NUM_READBACKS,
+            .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .queueFamilyIndexCount = 0,
+            .pQueueFamilyIndices = nullptr,
+        },
+        MemoryUsage::Download);
     const VkDescriptorBufferInfo buffer_info{
         .buffer = *buffer,
         .offset = 0,
@@ -1095,7 +1135,42 @@ vk::DescriptorSetLayout MeshFallbackScratch::CreateSetLayout(const Device& devic
     });
 }
 
+std::optional<u32> MeshFallbackScratch::ReserveReadback(u64 hash, u32 groups, u32 capacity) {
+    if (readbacks_used >= NUM_READBACKS || readback.Mapped().empty()) {
+        return std::nullopt;
+    }
+    const u32 slot{readbacks_used++};
+    readback_slots[slot] = {
+        .tick = scheduler.CurrentTick(),
+        .hash = hash,
+        .groups = groups,
+        .capacity = capacity,
+        .pending = true,
+    };
+    return slot * READBACK_BYTES;
+}
+
+void MeshFallbackScratch::PollReadback() {
+    for (u32 slot = 0; slot < readbacks_used; ++slot) {
+        ReadbackSlot& entry{readback_slots[slot]};
+        if (!entry.pending || !scheduler.IsFree(entry.tick)) {
+            continue;
+        }
+        entry.pending = false;
+        readback.Invalidate();
+        std::array<u32, READBACK_BYTES / 4> words{};
+        std::memcpy(words.data(), readback.Mapped().data() + slot * READBACK_BYTES,
+                    READBACK_BYTES);
+        LOG_INFO(Render_Vulkan,
+                 "MeshFallback: readback {:016x} groups={} capacity={} -> draw {{{}, {}, {}, {}}} "
+                 "capacity word {} debug word {}",
+                 entry.hash, entry.groups, entry.capacity, words[0], words[1], words[2], words[3],
+                 words[4], words[5]);
+    }
+}
+
 std::optional<u32> MeshFallbackScratch::Allocate(VkDeviceSize size) {
+    PollReadback();
     size = Common::AlignUp(size, 256);
     if (size > CHUNK_SIZE) {
         return std::nullopt;

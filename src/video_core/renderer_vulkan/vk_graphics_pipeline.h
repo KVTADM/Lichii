@@ -102,8 +102,31 @@ public:
     /// The layout of set 1 (pipeline layouts only need an identical one).
     static vk::DescriptorSetLayout CreateSetLayout(const Device& device);
 
+    /// Debug: a readback slot for the header of the first draws, or nothing.
+    std::optional<u32> ReserveReadback(u64 hash, u32 groups, u32 capacity);
+
+    VkBuffer ReadbackBuffer() const noexcept {
+        return *readback;
+    }
+
+    static constexpr u32 READBACK_BYTES = 32;
+
 private:
+    void PollReadback();
+
+    struct ReadbackSlot {
+        u64 tick{};
+        u64 hash{};
+        u32 groups{};
+        u32 capacity{};
+        bool pending{};
+    };
+    static constexpr u32 NUM_READBACKS = 64;
+
     Scheduler& scheduler;
+    vk::Buffer readback;
+    std::array<ReadbackSlot, NUM_READBACKS> readback_slots{};
+    u32 readbacks_used{};
     vk::Buffer buffer;
     vk::DescriptorSetLayout set_layout;
     vk::DescriptorPool descriptor_pool;
