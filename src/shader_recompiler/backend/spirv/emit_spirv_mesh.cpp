@@ -449,10 +449,10 @@ std::vector<u32> EmitMeshFallbackVertex(const Profile& profile, const MeshInfo& 
                                                         position_values[3])};
     const Id outside{module.ConstantComposite(vec4_id, f32_two, f32_two, f32_zero, f32_one)};
     module.OpStore(position, module.OpSelect(vec4_id, in_range, position_value, outside));
-    for (u32 index = 0; index < IR::NUM_GENERICS; ++index) {
-        if (Sirit::ValidId(generics[index])) {
-            const auto& values{generic_values[index]};
-            module.OpStore(generics[index], module.OpCompositeConstruct(vec4_id, values[0],
+    for (u32 generic = 0; generic < IR::NUM_GENERICS; ++generic) {
+        if (Sirit::ValidId(generics[generic])) {
+            const auto& values{generic_values[generic]};
+            module.OpStore(generics[generic], module.OpCompositeConstruct(vec4_id, values[0],
                                                                         values[1], values[2],
                                                                         values[3]));
         }
