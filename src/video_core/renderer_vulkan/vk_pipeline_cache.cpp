@@ -1517,8 +1517,15 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 fallback_mesh_program = &programs[index];
             }
         }
+        // EDEN_NX2_MESH_FALLBACK=0 turns the fallback off (the pipelines are skipped as before).
+        static const bool fallback_disabled{[] {
+            const char* const value{std::getenv("EDEN_NX2_MESH_FALLBACK")};
+            return value != nullptr && value[0] == '0';
+        }()};
         const char* reason{};
-        if (has_task) {
+        if (fallback_disabled) {
+            reason = "disabled by EDEN_NX2_MESH_FALLBACK=0";
+        } else if (has_task) {
             reason = "task program";
         } else if (!fallback_mesh_program) {
             reason = "no mesh program";

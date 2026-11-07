@@ -904,6 +904,18 @@ void GraphicsPipeline::RecordMeshFallback(u32 groups, MeshFallbackScratch& scrat
         }
         return;
     }
+    // EDEN_NX2_MESH_FALLBACK=dispatch runs the compute shaders without drawing (to tell a GPU
+    // fault in them from one in the draw).
+    static const bool dispatch_only{[] {
+        const char* const value{std::getenv("EDEN_NX2_MESH_FALLBACK")};
+        return value != nullptr && value[0] == 'd';
+    }()};
+    static std::atomic<u32> logged_draws{};
+    if (logged_draws.fetch_add(1, std::memory_order_relaxed) < 40) {
+        LOG_INFO(Render_Vulkan,
+                 "MeshFallback: draw {:016x} groups={} capacity={} vertices bytes={} offset={}{}",
+                 key.Hash(), groups, capacity, size, *offset, dispatch_only ? " (no draw)" : "");
+    }
     const VkBuffer buffer{scratch.Buffer()};
     const VkDescriptorSet fallback_set{scratch.DescriptorSet()};
     // The dispatch runs outside the render pass, then the draw resumes it.
@@ -955,6 +967,9 @@ void GraphicsPipeline::RecordMeshFallback(u32 groups, MeshFallbackScratch& scrat
                                0, output_barrier);
     });
     scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
+    if (dispatch_only) {
+        return;
+    }
     scheduler.Record([this, buffer, fallback_set, offset = *offset](vk::CommandBuffer cmdbuf) {
         if (scheduler.GraphicsPipelineMissing() || !fallback_compute) {
             return;

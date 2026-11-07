@@ -316,6 +316,16 @@ void EmitMeshPrologue(EmitContext& ctx) {
     // Every invocation stores the zero: no branch here, the entry block's label is a phi
     // predecessor for later blocks.
     ctx.OpStore(ctx.mesh_primitive_count, ctx.u32_zero_value);
+    if (ctx.runtime_info.mesh_fallback) {
+        // No task program fills the input region: zero it, so that nothing the program reads
+        // from it (loop bounds) is garbage. Clamped stores, still without a branch.
+        const Id invocation{LocalInvocation(ctx)};
+        const u32 words{ctx.mesh_info.payload_words};
+        for (u32 first = 0; first < words; first += ctx.mesh_threads) {
+            const Id index{ctx.OpIAdd(ctx.U32[1], invocation, ctx.Const(first))};
+            ctx.OpStore(PayloadWord(ctx, index), ctx.u32_zero_value);
+        }
+    }
     Barrier(ctx);
 }
 
