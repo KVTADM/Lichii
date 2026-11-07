@@ -1433,6 +1433,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
 
     // Layer passthrough generation for devices without VK_EXT_shader_viewport_index_layer
     Shader::IR::Program* layer_source_program{};
+    bool mesh_without_support{};
 
     for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
         const bool is_emulated_stage = layer_source_program != nullptr &&
@@ -1471,7 +1472,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                             "be missing",
                             device.GetModelName());
             }
-            return nullptr;
+            // Fork (mesh fallback study): translate the stage anyway and describe it below.
+            mesh_without_support = true;
         }
 
         const u32 cfg_offset{static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
@@ -1498,6 +1500,39 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         if (programs[index].info.requires_layer_emulation) {
             layer_source_program = &programs[index];
         }
+    }
+    if (mesh_without_support) {
+        // Fork (mesh fallback study): describe each task/mesh pipeline the device cannot build,
+        // then skip it as before.
+        static std::atomic<u32> described{};
+        if (described.fetch_add(1, std::memory_order_relaxed) < 300) {
+            std::string stages;
+            for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
+                if (key.unique_hashes[index] == 0) {
+                    continue;
+                }
+                const Shader::IR::Program& program{programs[index]};
+                const Shader::Info& info{program.info};
+                stages += fmt::format(
+                    " [{} {:016x} wg={}x{}x{} shared={} local={} cbufs={} ssbos={} tex={} img={}",
+                    static_cast<int>(program.stage), key.unique_hashes[index],
+                    program.workgroup_size[0], program.workgroup_size[1],
+                    program.workgroup_size[2], program.shared_memory_size,
+                    program.local_memory_size, info.constant_buffer_descriptors.size(),
+                    info.storage_buffers_descriptors.size(), info.texture_descriptors.size(),
+                    info.image_descriptors.size());
+                if (program.stage == Shader::Stage::Task || program.stage == Shader::Stage::Mesh) {
+                    const Shader::MeshInfo& mesh{program.mesh};
+                    stages += fmt::format(" payload={} maxv={} maxp={} topo={} vlines={} plines={}",
+                                          mesh.payload_words, mesh.max_vertices,
+                                          mesh.max_primitives, mesh.topology,
+                                          mesh.vertex_lines.size(), mesh.primitive_lines.size());
+                }
+                stages += "]";
+            }
+            LOG_WARNING(Render_Vulkan, "MeshFallback study: pipeline {:016x}{}", hash, stages);
+        }
+        return nullptr;
     }
     // A tessellation pipeline the driver would refuse is skipped like a missing mesh pipeline:
     // the draw is dropped (see the pipeline check in the rasterizer) instead of failing the build.
