@@ -1127,7 +1127,15 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             graphics_duplicates.push_back({record, first->second.first});
         }
 
-        if (!device.IsExtMeshShaderSupported() &&
+        // Fork (KVTADM): task/mesh pipelines load from the disk cache without VK_EXT_mesh_shader
+        // too: CreateGraphicsPipeline emulates them through compute, and building them at boot
+        // spares the 10-20 s AMD driver builds (and the VRAM spike) in game.
+        // EDEN_NX2_SKIP_MESH_PRELOAD=1 restores the old skip.
+        static const bool skip_mesh_preload{[] {
+            const char* const value{std::getenv("EDEN_NX2_SKIP_MESH_PRELOAD")};
+            return value != nullptr && value[0] == '1';
+        }()};
+        if (!device.IsExtMeshShaderSupported() && skip_mesh_preload &&
             std::ranges::any_of(envs, [](const FileEnvironment& env) {
                 return env.ShaderStage() == Shader::Stage::Task ||
                        env.ShaderStage() == Shader::Stage::Mesh;
