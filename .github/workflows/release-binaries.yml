@@ -80,9 +80,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Fork (KVTADM): Windows only, standard build, to compare against official build-95.
-          - platform: windows-x86_64
+          # Fork (KVTADM): Windows PGO only, same as the official recommended download.
+          - platform: windows-x86_64-pgo
             runner: windows-2022
+            pgo: true
+            profile: lichii-windows.profdata
 
     steps:
       - name: Check out source
