@@ -243,7 +243,39 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
     if (device.IsBufferDeviceAddressSupported()) {
         buffer_ci.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     }
-    vk::Buffer buffer = memory_allocator.CreateBuffer(buffer_ci, usage);
+    vk::Buffer buffer;
+    try {
+        buffer = memory_allocator.CreateBuffer(buffer_ci, usage);
+    } catch (const vk::Exception& exception) {
+        // Fork (KVTADM): an allocation failure here aborted the emulator (Ocarina of Time,
+        // Hyrule Castle on an 8 GB RX 5700 XT). Free every idle staging buffer and retry once;
+        // an upload may still fall back to device-local host-visible memory.
+        size_t freed{};
+        for (StagingBuffersCache* const cache : {&device_local_cache, &upload_cache,
+                                                 &download_cache}) {
+            for (StagingBuffers& level : *cache) {
+                const size_t before{level.entries.size()};
+                std::erase_if(level.entries, [this](const StagingBuffer& entry) {
+                    return !entry.deferred && scheduler.IsFree(entry.tick);
+                });
+                freed += before - level.entries.size();
+                level.delete_index = 0;
+                level.iterate_index = 0;
+            }
+        }
+        LOG_WARNING(Render_Vulkan,
+                    "Staging buffer of {} MiB failed ({}): freed {} idle staging buffers, retrying",
+                    buffer_ci.size >> 20, exception.what(), freed);
+        try {
+            buffer = memory_allocator.CreateBuffer(buffer_ci, usage);
+        } catch (const vk::Exception&) {
+            if (usage != MemoryUsage::Upload) {
+                throw;
+            }
+            LOG_WARNING(Render_Vulkan, "Upload staging buffer retried in stream memory");
+            buffer = memory_allocator.CreateBuffer(buffer_ci, MemoryUsage::Stream);
+        }
+    }
     if (device.HasDebuggingToolAttached()) {
         ++buffer_index;
         buffer.SetObjectNameEXT(fmt::format("Staging Buffer {}", buffer_index).c_str());
