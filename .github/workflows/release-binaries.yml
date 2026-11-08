@@ -606,6 +606,19 @@ jobs:
         with:
           pattern: lichii-*-${{ github.sha }}
           path: artifacts
+          # Fork: one artifact only, so keep it in its own folder like upstream's many.
+          merge-multiple: false
+
+      - name: Keep a single artifact in its own folder
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -e artifacts/lichii.exe ]; then
+            dir="artifacts/lichii-windows-x86_64-pgo-${GITHUB_SHA}"
+            mkdir "$dir.tmp" && find artifacts -mindepth 1 -maxdepth 1 ! -name "$(basename "$dir").tmp" -exec mv {} "$dir.tmp/" \;
+            mv "$dir.tmp" "$dir"
+          fi
+          ls artifacts
 
       - name: Package release files
         shell: bash
