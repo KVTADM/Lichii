@@ -102,27 +102,30 @@ if (MSVC AND NOT CXX_CLANG)
         /Zc:throwingNew
         /GT
 
+        # Fork (KVTADM): upstream builds Windows with clang-cl; the local MSVC build keeps
+        # these as warnings (level 4) instead of errors so upstream code compiles.
+
         # External headers diagnostics
         /external:anglebrackets # Treats all headers included by #include <header>, where the header file is enclosed in angle brackets (< >), as external headers
         /external:W0            # Sets the default warning level to 0 for external headers, effectively disabling warnings for them.
 
-        /we4062 # Enumerator 'identifier' in a switch of enum 'enumeration' is not handled
-        /we4189 # 'identifier': local variable is initialized but not referenced
-        /we4265 # 'class': class has virtual functions, but destructor is not virtual
-        /we4388 # 'expression': signed/unsigned mismatch
-        /we4389 # 'operator': signed/unsigned mismatch
-        /we4456 # Declaration of 'identifier' hides previous local declaration
-        /we4457 # Declaration of 'identifier' hides function parameter
-        /we4458 # Declaration of 'identifier' hides class member
-        /we4459 # Declaration of 'identifier' hides global declaration
+        /w44062 # Enumerator 'identifier' in a switch of enum 'enumeration' is not handled
+        /w44189 # 'identifier': local variable is initialized but not referenced
+        /w44265 # 'class': class has virtual functions, but destructor is not virtual
+        /w44388 # 'expression': signed/unsigned mismatch
+        /w44389 # 'operator': signed/unsigned mismatch
+        /w44456 # Declaration of 'identifier' hides previous local declaration
+        /w44457 # Declaration of 'identifier' hides function parameter
+        /w44458 # Declaration of 'identifier' hides class member
+        /w44459 # Declaration of 'identifier' hides global declaration
         /w44505 # 'function': unreferenced local function has been removed
-        /we4547 # 'operator': operator before comma has no effect; expected operator with side-effect
-        /we4549 # 'operator1': operator before comma has no effect; did you intend 'operator2'?
-        /we4555 # Expression has no effect; expected expression with side-effect
-        /we4826 # Conversion from 'type1' to 'type2' is sign-extended. This may cause unexpected runtime behavior.
-        /we5038 # data member 'member1' will be initialized after data member 'member2'
-        /we5233 # explicit lambda capture 'identifier' is not used
-        /we5245 # 'function': unreferenced function with internal linkage has been removed
+        /w44547 # 'operator': operator before comma has no effect; expected operator with side-effect
+        /w44549 # 'operator1': operator before comma has no effect; did you intend 'operator2'?
+        /w44555 # Expression has no effect; expected expression with side-effect
+        /w44826 # Conversion from 'type1' to 'type2' is sign-extended. This may cause unexpected runtime behavior.
+        /w45038 # data member 'member1' will be initialized after data member 'member2'
+        /w45233 # explicit lambda capture 'identifier' is not used
+        /w45245 # 'function': unreferenced function with internal linkage has been removed
 
         /wd4100 # 'identifier': unreferenced formal parameter
         /wd4324 # 'struct_name': structure was padded due to __declspec(align())
