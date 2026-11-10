@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -767,6 +768,19 @@ constexpr u8 UsedPipelinesMaxAge = 16;
 constexpr u8 UsedPipelinesMaxAgeMoltenVK = 8;
 
 u8 MaxUsedPipelineAge(const Device& device) {
+    // Fork (KVTADM): EDEN_NX2_USED_PIPELINE_AGE=N (1-16) keeps only the last N sessions' lists.
+    // On an RX 5700 XT the sixteen-session list reached 13,800 pipelines: 32-43 minutes of driver
+    // compiles at every boot and ~6 GB of driver memory before the game starts.
+    static const u8 override_age = [] {
+        const char* value = std::getenv("EDEN_NX2_USED_PIPELINE_AGE");
+        if (value == nullptr) {
+            return u8{0};
+        }
+        return static_cast<u8>(std::clamp(std::atoi(value), 0, 16));
+    }();
+    if (override_age != 0) {
+        return override_age;
+    }
     if (device.IsMoltenVK()) {
         return UsedPipelinesMaxAgeMoltenVK;
     }
